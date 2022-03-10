@@ -393,10 +393,6 @@ class JTAGPHY(Module):
 
         # # #
 
-        valid = Signal()
-        data  = Signal(data_width)
-        count = Signal(max=data_width)
-
         # JTAG TAP ---------------------------------------------------------------------------------
         if jtag is None:
             # Xilinx.
@@ -437,36 +433,140 @@ class JTAGPHY(Module):
             sink, source = tx_cdc.source, rx_cdc.sink
 
         # JTAG Xfer FSM ----------------------------------------------------------------------------
-        fsm = FSM(reset_state="XFER-READY")
-        fsm = ClockDomainsRenamer("jtag")(fsm)
-        fsm = ResetInserter()(fsm)
-        self.submodules += fsm
-        self.comb += fsm.reset.eq(jtag.reset | jtag.capture)
-        fsm.act("XFER-READY",
-            jtag.tdo.eq(source.ready),
-            If(jtag.shift,
-                sink.ready.eq(jtag.tdi),
-                NextValue(valid, sink.valid),
-                NextValue(data,  sink.data),
-                NextValue(count, 0),
-                NextState("XFER-DATA")
-            )
-        )
-        fsm.act("XFER-DATA",
-            jtag.tdo.eq(data),
-            If(jtag.shift,
-                NextValue(count, count + 1),
-                NextValue(data, Cat(data[1:], jtag.tdi)),
-                If(count == (data_width - 1),
-                    NextState("XFER-VALID")
+        if False:
+            valid = Signal()
+            data  = Signal(data_width)
+            count = Signal(max=data_width)
+
+            fsm = FSM(reset_state="XFER-READY")
+            fsm = ClockDomainsRenamer("jtag")(fsm)
+            fsm = ResetInserter()(fsm)
+            self.submodules += fsm
+            self.comb += fsm.reset.eq(jtag.reset | jtag.capture)
+            fsm.act("XFER-READY",
+                jtag.tdo.eq(source.ready),
+                If(jtag.shift,
+                    sink.ready.eq(jtag.tdi),
+                    NextValue(valid, sink.valid),
+                    NextValue(data,  sink.data),
+                    NextValue(count, 0),
+                    NextState("XFER-DATA")
                 )
             )
-        )
-        fsm.act("XFER-VALID",
-            jtag.tdo.eq(valid),
-            If(jtag.shift,
-                source.valid.eq(jtag.tdi),
-                NextState("XFER-READY")
+            fsm.act("XFER-DATA",
+                jtag.tdo.eq(data),
+                If(jtag.shift,
+                    NextValue(count, count + 1),
+                    NextValue(data, Cat(data[1:], jtag.tdi)),
+                    If(count == (data_width - 1),
+                        NextState("XFER-VALID")
+                    )
+                )
             )
-        )
-        self.comb += source.data.eq(data)
+            fsm.act("XFER-VALID",
+                jtag.tdo.eq(valid),
+                If(jtag.shift,
+                    source.valid.eq(jtag.tdi),
+                    NextState("XFER-READY")
+                )
+            )
+            self.comb += source.data.eq(data)
+
+        elif False:
+            # JTAG compliant version using CAPTURE / UPDATE for data xfer
+            self.shift = shift = Signal(data_width+2)
+            self.xfer  = xfer  = Signal()
+
+            self.sync.jtag += [
+                If(jtag.capture,
+                    shift.eq(Cat(source.ready, sink.data, sink.valid)),
+                    xfer.eq(sink.valid),
+                ).Elif(jtag.shift,
+                    shift.eq(Cat(shift[1:], jtag.tdi)),
+                ).Elif(jtag.capture,
+                    xfer.eq(0),
+                ),
+            ]
+
+            self.comb += [
+                jtag.tdo.eq(shift[0]),
+                source.data.eq(shift[1:-1]),
+                source.valid.eq(shift[-1] & jtag.update),
+                sink.ready.eq(shift[0] & jtag.update & xfer),
+            ]
+
+        else:
+            # Non-JTAG compliant version that works with just continuous
+            # shifting in DRSCAN and DRPAUSE
+
+            # Number of bypassed taps
+            offset = 1
+
+            # Status sampled as exchanged
+            source_ready   = Signal()
+            source_ready_r = Signal()
+            sink_ready     = Signal()
+            sink_valid     = Signal()
+
+            # OpenOCD Workaround
+            # In my understanding of JTAG, going to PauseDR should be a
+            # 'transparent' pause of the shifting of DR. But OpenOCD
+            # inserts dummy-bits for BYPASSED taps again so ... reset
+            # our state on any events that's not shift instead of capture
+            start = Signal()
+            #self.comb += start.eq(jtag.capture)
+            self.comb += start.eq(~jtag.shift)
+
+            # Output
+            out_shift = Signal(data_width+2)
+            out_count = Signal(max=data_width+2)
+
+            self.sync.jtag += [
+                If(start | (jtag.shift & (out_count == (data_width+1))),
+                    out_shift.eq(Cat(source.ready, sink.data, sink.valid)),
+                    out_count.eq(0),
+                    sink_valid.eq(sink.valid),
+                    source_ready.eq(source.ready),
+                ).Elif(jtag.shift,
+                    out_shift.eq(Cat(out_shift[1:], Constant(0, 1))),
+                    out_count.eq(out_count + 1)
+                ),
+            ]
+
+            self.comb += [
+                jtag.tdo.eq(out_shift[0]),
+                sink.ready.eq(sink_valid & sink_ready & jtag.shift & (out_count == data_width)),
+            ]
+
+            # Input
+            in_shift  = Signal(data_width)
+            in_count  = Signal(max=data_width+2+offset)
+
+            self.sync.jtag += [
+                If(start,
+                    in_count.eq(0),
+                ).Elif(jtag.shift,
+                    # Counter
+                    If(in_count == (data_width+1+offset),
+                        in_count.eq(offset),
+                    ).Else(
+                        in_count.eq(in_count + 1),
+                    ),
+                    # Capture sink_ready
+                    If(in_count == offset,
+                        sink_ready.eq(jtag.tdi),
+                    ),
+                    # Capture source_ready for this word
+                    If(in_count == (offset+1),
+                        source_ready_r.eq(source_ready),
+                    ),
+                    # Dumb shift register
+                    in_shift.eq(Cat(in_shift[1:], jtag.tdi)),
+                ),
+            ]
+
+            self.comb += [
+                source.data.eq(in_shift),
+                source.valid.eq(jtag.tdi & source_ready_r & jtag.shift & (in_count == (data_width+1+offset))),
+            ]
+

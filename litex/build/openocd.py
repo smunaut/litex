@@ -44,13 +44,17 @@ class OpenOCD(GenericProgrammer):
         cfg_str = open(config).read()
         ecp5 = "ecp5" in cfg_str
         altera = "10m50" in cfg_str # TODO: or cyclone 10
+        zynqmp = "zynqmp" in cfg_str
         if ecp5:
             chain = 0x32
         elif altera:
             chain = 0xC
-        # Else IR = 1 + CHAIN.
+        # ZynqMP have 12-bit IR
+        elif zynqmp:
+            chain = { 1: 0x902, 2: 0x903, 3: 0x922, 4: 0x923 }[chain]
+        # Else assume xilinx 7 series
         else:
-            chain = 0x1 + chain
+            chain = { 1: 0x02, 2: 0x03, 3: 0x22, 4: 0x23 }[chain]
         return chain
 
     def stream(self, port=20000, chain=1):
